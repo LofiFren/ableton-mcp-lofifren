@@ -225,20 +225,31 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "get_clip_notes":
+                # Read-only operation, safe to execute directly like get_track_info
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_clip_notes(track_index, clip_index)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item",
-                                 "get_clip_notes", "remove_notes_from_clip", "delete_clip",
+                                 "remove_notes_from_clip", "delete_clip",
                                  "duplicate_clip_to", "set_track_volume", "set_track_pan",
                                  "set_track_send", "fire_scene", "create_audio_track", "undo"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
-                
+                # Cancellation flag: if the wait times out, prevent late execution
+                # of destructive operations that haven't started yet
+                cancelled = [False]
+
                 # Define a function to execute on the main thread
                 def main_thread_task():
                     try:
+                        if cancelled[0]:
+                            self.log_message("Skipping cancelled command: " + command_type)
+                            return
                         result = None
                         if command_type == "create_midi_track":
                             index = params.get("index", -1)
@@ -285,10 +296,6 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
-                        elif command_type == "get_clip_notes":
-                            track_index = params.get("track_index", 0)
-                            clip_index = params.get("clip_index", 0)
-                            result = self._get_clip_notes(track_index, clip_index)
                         elif command_type == "remove_notes_from_clip":
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
@@ -351,8 +358,10 @@ class AbletonMCP(ControlSurface):
                     else:
                         response["result"] = task_response.get("result", {})
                 except queue.Empty:
+                    cancelled[0] = True
+                    self.log_message("Timeout for command: " + command_type + " - marking cancelled")
                     response["status"] = "error"
-                    response["message"] = "Timeout waiting for operation to complete"
+                    response["message"] = "Timeout waiting for operation to complete. The operation was cancelled to prevent unintended side effects."
             elif command_type == "get_browser_item":
                 uri = params.get("uri", None)
                 path = params.get("path", None)
