@@ -105,7 +105,7 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
+            "start_playback", "stop_playback", "load_browser_item",
             "remove_notes_from_clip", "delete_clip",
             "duplicate_clip_to", "set_track_volume", "set_track_pan",
             "set_track_send", "fire_scene", "undo"
