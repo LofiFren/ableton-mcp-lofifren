@@ -2,6 +2,10 @@
 
 > **Fork notice:** This is a fork of [`ahujasid/ableton-mcp`](https://github.com/ahujasid/ableton-mcp) extending it with a 33-personality style system and ~35 additional MCP tools. The original project is by [Siddharth Ahuja](https://x.com/sidahuj) and remains MIT-licensed. This fork is published to PyPI as **`ableton-mcp-lofifren`**.
 
+[![PyPI](https://img.shields.io/pypi/v/ableton-mcp-lofifren?label=PyPI&color=3775A9&logo=pypi&logoColor=white)](https://pypi.org/project/ableton-mcp-lofifren/)
+[![Add MCP server to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=ableton-mcp-lofifren&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyJhYmxldG9uLW1jcC1sb2ZpZnJlbiJdfQ%3D%3D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install%20MCP%20Server-0098FF?style=flat&logo=visualstudiocode&logoColor=white)](vscode:mcp/install?%7B%22name%22%3A%22ableton-mcp-lofifren%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22ableton-mcp-lofifren%22%5D%7D)
+
 AbletonMCP connects Ableton Live to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Ableton Live. This integration enables prompt-assisted music production, track creation, and Live session manipulation.
 
 ### Join the Community
@@ -175,7 +179,7 @@ The system consists of two main components:
 
 ## Installation
 
-> **Note:** the upstream `@ahujasid/ableton-mcp` Smithery listing and the `ableton-mcp` PyPI package install the *original* project, not this fork — they will not include the personality system or any of the ~35 additional tools added here. Use the install instructions below to get this fork.
+> **Note:** the upstream `ableton-mcp` PyPI package and `@ahujasid/ableton-mcp` Smithery listing install the *original* project — they will **not** include the personality system or the ~35 additional tools in this fork. To get this fork, install **`ableton-mcp-lofifren`** from PyPI as shown below.
 
 ### Prerequisites
 
@@ -203,25 +207,29 @@ Otherwise, install from [uv's official website][https://docs.astral.sh/uv/gettin
     "mcpServers": {
         "AbletonMCP": {
             "command": "uvx",
-            "args": [
-                "--from",
-                "git+https://github.com/LofiFren/ableton-mcp-lofifren.git",
-                "ableton-mcp-lofifren"
-            ]
+            "args": ["ableton-mcp-lofifren"]
         }
     }
 }
 ```
 
-This installs the fork directly from GitHub on first run. Once `ableton-mcp-lofifren` is published to PyPI you can simplify this to just `"args": ["ableton-mcp-lofifren"]`.
+`uvx` will fetch `ableton-mcp-lofifren` from PyPI on first launch and cache it. To install from a development branch instead, replace the args with `["--from", "git+https://github.com/LofiFren/ableton-mcp-lofifren.git", "ableton-mcp-lofifren"]`.
 
 ### Cursor Integration
 
-Run this fork without installing it permanently through uvx. Go to Cursor Settings > MCP and paste this as a command:
+**One-click**: use the *Add MCP server to Cursor* badge at the top of this README — it pre-fills the config and opens Cursor.
+
+**Manual**: go to Cursor Settings → MCP and paste this as a command:
 
 ```
-uvx --from git+https://github.com/LofiFren/ableton-mcp-lofifren.git ableton-mcp-lofifren
+uvx ableton-mcp-lofifren
 ```
+
+### VS Code Integration
+
+**One-click**: use the *Install in VS Code* badge at the top of this README. Requires the [MCP extension for VS Code](https://marketplace.visualstudio.com/search?term=mcp&target=VSCode).
+
+**Manual**: open the command palette → *MCP: Add Server* → Stdio → command `uvx`, args `ableton-mcp-lofifren`.
 
 ⚠️ Only run one instance of the MCP server (either on Cursor or Claude Desktop), not both
 
