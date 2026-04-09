@@ -205,7 +205,7 @@ Otherwise, install from [uv's official website][https://docs.astral.sh/uv/gettin
 ```json
 {
     "mcpServers": {
-        "AbletonMCP": {
+        "ableton-mcp-lofifren": {
             "command": "uvx",
             "args": ["ableton-mcp-lofifren"]
         }
