@@ -759,16 +759,34 @@ class AbletonMCP(ControlSurface):
             raise
     
     def _find_browser_item_by_uri(self, browser_or_item, uri, max_depth=10, current_depth=0):
-        """Find a browser item by its URI"""
+        """Find a browser item by its URI.
+
+        Top-level lookups are memoised on ``self._uri_cache`` so repeated
+        loads of the same URI don't re-walk the entire browser tree.
+        """
+        if current_depth == 0:
+            cache = getattr(self, '_uri_cache', None)
+            if cache is None:
+                self._uri_cache = cache = {}
+            if uri in cache:
+                return cache[uri]
+            result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
+            if result is not None:
+                cache[uri] = result
+            return result
+        return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
+
+    def _walk_browser_for_uri(self, browser_or_item, uri, max_depth, current_depth):
+        """Recursive walk used by :py:meth:`_find_browser_item_by_uri`."""
         try:
             # Check if this is the item we're looking for
             if hasattr(browser_or_item, 'uri') and browser_or_item.uri == uri:
                 return browser_or_item
-            
+
             # Stop recursion if we've reached max depth
             if current_depth >= max_depth:
                 return None
-            
+
             # Check if this is a browser with root categories
             if hasattr(browser_or_item, 'instruments'):
                 # Check all main categories
@@ -779,21 +797,29 @@ class AbletonMCP(ControlSurface):
                     browser_or_item.audio_effects,
                     browser_or_item.midi_effects
                 ]
-                
+                # Walk plugins / max_for_live / user_library / packs / samples
+                # so URIs from get_browser_items_at_path for plugins actually load.
+                for extra_attr in ('plugins', 'max_for_live', 'user_library', 'packs', 'samples'):
+                    if hasattr(browser_or_item, extra_attr):
+                        try:
+                            categories.append(getattr(browser_or_item, extra_attr))
+                        except (AttributeError, RuntimeError) as e:
+                            self.log_message("Could not access browser.{0}: {1}".format(extra_attr, str(e)))
+
                 for category in categories:
                     item = self._find_browser_item_by_uri(category, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-                
+
                 return None
-            
+
             # Check if this item has children
             if hasattr(browser_or_item, 'children') and browser_or_item.children:
                 for child in browser_or_item.children:
                     item = self._find_browser_item_by_uri(child, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-            
+
             return None
         except Exception as e:
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
