@@ -18,6 +18,11 @@ except ImportError:
 DEFAULT_PORT = 9877
 HOST = "localhost"
 
+# Soft TTL for the browser-URI lookup cache (seconds). Long enough to absorb
+# bursts of repeated loads in a session, short enough that a browser rescan
+# (new plugin installed, packs refreshed) gets picked up without restart.
+URI_CACHE_TTL_SECONDS = 300
+
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
     return AbletonMCP(c_instance)
@@ -2008,18 +2013,39 @@ class AbletonMCP(ControlSurface):
 
         Top-level lookups are memoised on ``self._uri_cache`` so repeated
         loads of the same URI don't re-walk the entire browser tree.
+
+        Layered on top of @lukegimza's category-walk fix (#1): the original
+        cache was unbounded and never invalidated. We added (a) a soft TTL
+        (``URI_CACHE_TTL_SECONDS``) so a browser rescan eventually gets
+        re-resolved without restarting Live, and (b) a validate-on-hit
+        check, because a cached ``BrowserItem`` reference can be orphaned
+        when Live refreshes the browser -- accessing ``.uri`` then raises
+        or returns a different value, which we treat as a cache miss.
         """
         if current_depth == 0:
             cache = getattr(self, '_uri_cache', None)
             if cache is None:
                 self._uri_cache = cache = {}
-            if uri in cache:
-                return cache[uri]
+            entry = cache.get(uri)
+            if entry is not None:
+                cached_item, expires_at = entry
+                if time.time() < expires_at and self._uri_cache_entry_valid(cached_item, uri):
+                    return cached_item
+                del cache[uri]
             result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
             if result is not None:
-                cache[uri] = result
+                cache[uri] = (result, time.time() + URI_CACHE_TTL_SECONDS)
             return result
         return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
+
+    def _uri_cache_entry_valid(self, item, uri):
+        """Return True if a cached BrowserItem still resolves to ``uri``.
+        A stale reference (post browser refresh) may raise on attribute
+        access or report a different URI."""
+        try:
+            return getattr(item, 'uri', None) == uri
+        except (AttributeError, RuntimeError):
+            return False
 
     def _walk_browser_for_uri(self, browser_or_item, uri, max_depth, current_depth):
         """Recursive walk used by :py:meth:`_find_browser_item_by_uri`."""
