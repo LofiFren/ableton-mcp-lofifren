@@ -293,6 +293,7 @@ class AbletonMCP(ControlSurface):
         self._async_modifying_commands = {
             "add_arrangement_locator":         self._add_arrangement_locator_async,
             "clear_all_arrangement_locators":  self._clear_all_arrangement_locators_async,
+            "delete_arrangement_locator":      self._delete_arrangement_locator_async,
         }
 
     def _process_command(self, command):
@@ -1670,20 +1671,53 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting arrangement loop: " + str(e))
             raise
 
+    # One Live control-surface tick is ~100ms. We retry the position commit on a
+    # NON-ZERO tick delay: schedule_message(0, ...) reschedules pump within a
+    # single Live frame, so current_song_time never gets an engine frame to
+    # commit -- which is why every locator op failed on the first call ("stuck at
+    # <previous position>") and only landed on a later call. Waiting real ticks
+    # (and re-asserting the write each tick) lets a single call succeed.
+    _COMMIT_RETRY_DELAY = 1
+    _COMMIT_MAX_TICKS = 30
+
+    def _commit_song_time(self, target_time, cancelled, on_ready, on_fail):
+        """Drive ``song.current_song_time`` to ``target_time`` and invoke
+        ``on_ready()`` once Live has actually committed the playhead within 0.01
+        beats. Re-asserts the write on every tick and waits a real tick between
+        checks. Calls ``on_fail(message)`` if it has not committed within
+        ``_COMMIT_MAX_TICKS`` ticks. Shared by add / delete / clear_all so the
+        commit logic can never drift between them again."""
+        song = self._song
+        target = float(target_time)
+        state = {"n": 0}
+        song.current_song_time = target
+
+        def check():
+            if cancelled[0]:
+                return
+            try:
+                if abs(song.current_song_time - target) <= 0.01:
+                    on_ready()
+                    return
+                state["n"] += 1
+                if state["n"] > self._COMMIT_MAX_TICKS:
+                    on_fail("Playhead did not reach target {0} after {1} ticks (stuck at {2})".format(
+                        target, self._COMMIT_MAX_TICKS, song.current_song_time))
+                    return
+                song.current_song_time = target
+                self.schedule_message(self._COMMIT_RETRY_DELAY, check)
+            except Exception as e:
+                self.log_message("Error in _commit_song_time check: " + str(e))
+                self.log_message(traceback.format_exc())
+                on_fail(str(e))
+
+        self.schedule_message(self._COMMIT_RETRY_DELAY, check)
+
     def _add_arrangement_locator_async(self, params, response_queue, cancelled):
-        """Add a named locator at the given arrangement time using a chained
-        main-thread callback so Live can commit ``current_song_time`` between
-        the position write and the ``set_or_delete_cue`` toggle.
-
-        Three closures (this method runs on main thread tick 1):
-            Tick 1: snapshot cue times, write current_song_time, schedule tick 2
-            Tick 2: call set_or_delete_cue, schedule tick 3
-            Tick 3: snapshot-diff to find the new cue, set its name, put result
-
-        Each ``schedule_message(0, ...)`` call yields the main thread back to
-        Live, which then has the chance to commit the queued state from the
-        previous tick before the next callback runs.
-        """
+        """Add a named locator at the given arrangement time. Drives the playhead
+        to the target via ``_commit_song_time`` (which waits real ticks and
+        re-asserts the write), then toggles ``set_or_delete_cue()`` to create the
+        cue and names it."""
         try:
             target_time_f = float(params.get("time", 0.0))
             name = params.get("name", "")
@@ -1716,16 +1750,14 @@ class AbletonMCP(ControlSurface):
             except Exception:
                 before_times = set()
 
-            # Step 1: write play head position. Live needs a tick to commit it.
-            song.current_song_time = target_time_f
+            def on_fail(msg):
+                response_queue.put({"status": "error", "message": msg})
 
-            def step2_toggle():
-                if cancelled[0]:
-                    return
+            def on_ready():
                 try:
                     song.set_or_delete_cue()
 
-                    def step3_finalize():
+                    def finalize():
                         if cancelled[0]:
                             return
                         try:
@@ -1735,7 +1767,7 @@ class AbletonMCP(ControlSurface):
                                     new_cue = cue
                                     break
                             if new_cue is None:
-                                # Fallback: closest cue to target_time within window
+                                # Fallback: closest cue to target within window
                                 closest = None
                                 closest_dist = float("inf")
                                 for cue in song.cue_points:
@@ -1758,28 +1790,28 @@ class AbletonMCP(ControlSurface):
                                 "created": True,
                             }})
                         except Exception as e:
-                            self.log_message("Error in step3_finalize: " + str(e))
+                            self.log_message("Error in add finalize: " + str(e))
                             self.log_message(traceback.format_exc())
                             response_queue.put({"status": "error", "message": str(e)})
 
-                    self.schedule_message(0, step3_finalize)
+                    self.schedule_message(self._COMMIT_RETRY_DELAY, finalize)
                 except Exception as e:
-                    self.log_message("Error in step2_toggle: " + str(e))
+                    self.log_message("Error in add on_ready: " + str(e))
                     self.log_message(traceback.format_exc())
                     response_queue.put({"status": "error", "message": str(e)})
 
-            self.schedule_message(0, step2_toggle)
+            self._commit_song_time(target_time_f, cancelled, on_ready, on_fail)
         except Exception as e:
             self.log_message("Error in _add_arrangement_locator_async: " + str(e))
             self.log_message(traceback.format_exc())
             response_queue.put({"status": "error", "message": str(e)})
 
     def _clear_all_arrangement_locators_async(self, params, response_queue, cancelled):
-        """Delete every cue point from the arrangement, one at a time, with
-        chained main-thread callbacks so position writes commit before each
-        toggle. Each cue takes 3 ticks (write position → toggle → continue),
-        so 8 cues = ~24 ticks, plenty of time for Live to process between
-        operations."""
+        """Delete every locator from the arrangement, one at a time, using the
+        same ``_commit_song_time`` guard as the single-delete path so each
+        position commits before its toggle. ``cleared`` only increments when the
+        cue count actually drops -- the old code counted attempts and reported a
+        false success (e.g. cleared:1 / remaining:2 while deleting nothing)."""
         try:
             caps = self._arrangement_capabilities()
             if not caps.get("has_set_or_delete_cue") or not caps.get("has_cue_points"):
@@ -1788,54 +1820,119 @@ class AbletonMCP(ControlSurface):
                 return
             song = self._song
             try:
-                times = [c.time for c in song.cue_points]
+                times = [float(c.time) for c in song.cue_points]
             except Exception:
                 times = []
-            state = {"index": 0, "cleared": 0, "times": times}
+            state = {"index": 0, "cleared": 0}
+
+            def on_fail(msg):
+                response_queue.put({"status": "error", "message": msg})
 
             def process_next():
                 if cancelled[0]:
                     return
-                if state["index"] >= len(state["times"]):
+                if state["index"] >= len(times):
                     response_queue.put({"status": "success", "result": {
                         "cleared": state["cleared"],
                         "remaining": len(song.cue_points),
                     }})
                     return
-                t = state["times"][state["index"]]
+                target = times[state["index"]]
                 state["index"] += 1
-                try:
-                    song.current_song_time = float(t)
+                count_before = len(song.cue_points)
 
-                    def after_position():
-                        if cancelled[0]:
-                            return
-                        try:
-                            # Snapshot count so we know if the toggle deleted a cue
-                            count_before = len(song.cue_points)
-                            song.set_or_delete_cue()
+                def on_ready():
+                    try:
+                        song.set_or_delete_cue()
 
-                            def after_toggle():
-                                if cancelled[0]:
-                                    return
-                                try:
-                                    if len(song.cue_points) < count_before:
-                                        state["cleared"] += 1
-                                    process_next()
-                                except Exception as e:
-                                    response_queue.put({"status": "error", "message": str(e)})
+                        def after_toggle():
+                            if cancelled[0]:
+                                return
+                            try:
+                                if len(song.cue_points) < count_before:
+                                    state["cleared"] += 1
+                                process_next()
+                            except Exception as e:
+                                response_queue.put({"status": "error", "message": str(e)})
 
-                            self.schedule_message(0, after_toggle)
-                        except Exception as e:
-                            response_queue.put({"status": "error", "message": str(e)})
+                        self.schedule_message(self._COMMIT_RETRY_DELAY, after_toggle)
+                    except Exception as e:
+                        response_queue.put({"status": "error", "message": str(e)})
 
-                    self.schedule_message(0, after_position)
-                except Exception as e:
-                    response_queue.put({"status": "error", "message": str(e)})
+                self._commit_song_time(target, cancelled, on_ready, on_fail)
 
             process_next()
         except Exception as e:
             self.log_message("Error in _clear_all_arrangement_locators_async: " + str(e))
+            self.log_message(traceback.format_exc())
+            response_queue.put({"status": "error", "message": str(e)})
+
+    def _delete_arrangement_locator_async(self, params, response_queue, cancelled):
+        """Delete a single locator (cue point) near the given arrangement time.
+
+        Locates the nearest cue within ``tolerance``, drives the playhead onto its
+        exact time via ``_commit_song_time``, then toggles ``set_or_delete_cue()``
+        to remove it and confirms the cue count actually dropped."""
+        try:
+            target_time_f = float(params.get("time", 0.0))
+            tolerance = float(params.get("tolerance", 0.05))
+            caps = self._arrangement_capabilities()
+            if not caps.get("has_set_or_delete_cue") or not caps.get("has_cue_points"):
+                response_queue.put({"status": "error",
+                    "message": "This Live version does not expose cue_points or set_or_delete_cue"})
+                return
+            song = self._song
+
+            # Locate the cue to delete (nearest one within tolerance).
+            target_cue = None
+            for cue in song.cue_points:
+                if abs(cue.time - target_time_f) <= tolerance:
+                    target_cue = cue
+                    break
+            if target_cue is None:
+                response_queue.put({"status": "error",
+                    "message": "No locator within {0} beats of time {1}".format(tolerance, target_time_f)})
+                return
+
+            cue_time = float(target_cue.time)
+            cue_name = target_cue.name
+            count_before = len(song.cue_points)
+
+            def on_fail(msg):
+                response_queue.put({"status": "error", "message": msg})
+
+            def on_ready():
+                try:
+                    song.set_or_delete_cue()
+
+                    def verify():
+                        if cancelled[0]:
+                            return
+                        try:
+                            if len(song.cue_points) >= count_before:
+                                response_queue.put({"status": "error",
+                                    "message": "Toggle did not delete a cue at time {0}".format(cue_time)})
+                                return
+                            response_queue.put({"status": "success", "result": {
+                                "deleted": True,
+                                "time": cue_time,
+                                "name": cue_name,
+                                "remaining": len(song.cue_points),
+                            }})
+                        except Exception as e:
+                            self.log_message("Error in delete verify: " + str(e))
+                            self.log_message(traceback.format_exc())
+                            response_queue.put({"status": "error", "message": str(e)})
+
+                    self.schedule_message(self._COMMIT_RETRY_DELAY, verify)
+                except Exception as e:
+                    self.log_message("Error in delete on_ready: " + str(e))
+                    self.log_message(traceback.format_exc())
+                    response_queue.put({"status": "error", "message": str(e)})
+
+            self._commit_song_time(cue_time, cancelled, on_ready, on_fail)
+        except Exception as e:
+            self.log_message("Error in _delete_arrangement_locator_async: " + str(e))
             self.log_message(traceback.format_exc())
             response_queue.put({"status": "error", "message": str(e)})
 
