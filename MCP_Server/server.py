@@ -28,7 +28,7 @@ MODIFYING_COMMANDS = {
     "set_time_signature", "set_clip_loop", "set_clip_length",
     "set_track_arm", "set_track_mute", "set_track_solo",
     "delete_track", "set_master_volume", "set_device_parameter",
-    "set_parameter_by_display_value",
+    "set_parameter_by_display_value", "set_track_volume_db",
     "create_scene", "set_scene_name", "set_scene_tempo",
     # Tier 1 cross-track duplicate
     "duplicate_clip_cross_track",
@@ -665,6 +665,30 @@ def set_track_volume(ctx: Context, track_index: int, volume: float) -> str:
     except Exception as e:
         logger.error(f"Error setting track volume: {str(e)}")
         return f"Error setting track volume: {str(e)}"
+
+@mcp.tool()
+def set_track_volume_db(ctx: Context, track_index: int, db_value: float) -> str:
+    """
+    Set a track's volume by dB value instead of a raw 0.0-1.0 number. For
+    example db_value=-9.0 sets the fader to -9 dB. Convenience wrapper over the
+    display-value resolution (str_to_value, else a binary search on Live's dB
+    curve) applied to the track's mixer volume. Returns the resulting raw value
+    and dB display so you can confirm the landing.
+
+    Parameters:
+    - track_index: which track to set
+    - db_value: target volume in dB (e.g. -9.0, 0.0 for unity, up to +6)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_volume_db", {
+            "track_index": track_index,
+            "db_value": db_value,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting track volume (dB): {str(e)}")
+        return f"Error setting track volume (dB): {str(e)}"
 
 @mcp.tool()
 def set_track_pan(ctx: Context, track_index: int, pan: float) -> str:

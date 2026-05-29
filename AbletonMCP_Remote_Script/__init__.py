@@ -415,6 +415,7 @@ class AbletonMCP(ControlSurface):
             "delete_clip":            lambda p: self._delete_clip(p.get("track_index", 0), p.get("clip_index", 0)),
             "duplicate_clip_to":      lambda p: self._duplicate_clip_to(p.get("track_index", 0), p.get("clip_index", 0), p.get("target_clip_index", 0)),
             "set_track_volume":       lambda p: self._set_track_volume(p.get("track_index", 0), p.get("volume", 0.85)),
+            "set_track_volume_db":    lambda p: self._set_track_volume_db(p.get("track_index", 0), p.get("db_value", 0.0)),
             "set_track_pan":          lambda p: self._set_track_pan(p.get("track_index", 0), p.get("pan", 0.0)),
             "set_track_send":         lambda p: self._set_track_send(p.get("track_index", 0), p.get("send_index", 0), p.get("value", 0.0)),
             "fire_scene":             lambda p: self._fire_scene(p.get("scene_index", 0)),
@@ -1071,6 +1072,28 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error setting track volume: " + str(e))
+            raise
+
+    def _set_track_volume_db(self, track_index, db_value):
+        """Set a track's volume to a dB value (e.g. -9.0) using the same
+        display-value resolution as set_parameter_by_display_value, applied to
+        the track's mixer volume parameter (str_to_value, else binary search on
+        the dB curve). Returns the resulting raw value and dB display."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            vol = self._song.tracks[track_index].mixer_device.volume
+            raw, method = _resolve_param_raw(vol, "{0} dB".format(db_value), max_iter=12)
+            vol.value = max(vol.min, min(vol.max, float(raw)))
+            return {
+                "track_index": track_index,
+                "db_requested": float(db_value),
+                "method": method,
+                "raw_value": vol.value,
+                "display_value": self._safe_display_value(vol),
+            }
+        except Exception as e:
+            self.log_message("Error setting track volume (dB): " + str(e))
             raise
 
     def _set_track_pan(self, track_index, pan):
