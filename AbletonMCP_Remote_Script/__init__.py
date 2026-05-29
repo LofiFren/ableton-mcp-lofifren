@@ -1061,10 +1061,12 @@ class AbletonMCP(ControlSurface):
                 raise IndexError("Track index out of range")
 
             track = self._song.tracks[track_index]
-            track.mixer_device.volume.value = max(0.0, min(1.0, volume))
+            vol = track.mixer_device.volume
+            vol.value = max(0.0, min(1.0, volume))
 
             result = {
-                "volume": track.mixer_device.volume.value
+                "volume": vol.value,
+                "display_value": self._safe_display_value(vol),
             }
             return result
         except Exception as e:
@@ -1328,8 +1330,9 @@ class AbletonMCP(ControlSurface):
     def _set_master_volume(self, volume):
         """Set the master track volume (0.0 to 1.0)."""
         try:
-            self._song.master_track.mixer_device.volume.value = max(0.0, min(1.0, float(volume)))
-            return {"volume": self._song.master_track.mixer_device.volume.value}
+            vol = self._song.master_track.mixer_device.volume
+            vol.value = max(0.0, min(1.0, float(volume)))
+            return {"volume": vol.value, "display_value": self._safe_display_value(vol)}
         except Exception as e:
             self.log_message("Error setting master volume: " + str(e))
             raise
@@ -1357,6 +1360,7 @@ class AbletonMCP(ControlSurface):
                 "device_name": device.name,
                 "parameter_name": param.name,
                 "value": param.value,
+                "display_value": self._safe_display_value(param),
                 "min": param.min,
                 "max": param.max,
             }

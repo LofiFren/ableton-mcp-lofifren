@@ -659,7 +659,9 @@ def set_track_volume(ctx: Context, track_index: int, volume: float) -> str:
             "track_index": track_index,
             "volume": volume
         })
-        return f"Set track {track_index} volume to {result.get('volume', volume)}"
+        disp = result.get("display_value")
+        suffix = f" ({disp})" if disp else ""
+        return f"Set track {track_index} volume to {result.get('volume', volume)}{suffix}"
     except Exception as e:
         logger.error(f"Error setting track volume: {str(e)}")
         return f"Error setting track volume: {str(e)}"
@@ -1569,7 +1571,9 @@ def set_master_volume(ctx: Context, volume: float) -> str:
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("set_master_volume", {"volume": volume})
-        return f"Set master volume to {result.get('volume')}"
+        disp = result.get("display_value")
+        suffix = f" ({disp})" if disp else ""
+        return f"Set master volume to {result.get('volume')}{suffix}"
     except Exception as e:
         logger.error(f"Error setting master volume: {str(e)}")
         return f"Error setting master volume: {str(e)}"
