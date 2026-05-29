@@ -28,6 +28,7 @@ MODIFYING_COMMANDS = {
     "set_time_signature", "set_clip_loop", "set_clip_length",
     "set_track_arm", "set_track_mute", "set_track_solo",
     "delete_track", "set_master_volume", "set_device_parameter",
+    "set_parameter_by_display_value",
     "create_scene", "set_scene_name", "set_scene_tempo",
     # Tier 1 cross-track duplicate
     "duplicate_clip_cross_track",
@@ -1606,6 +1607,45 @@ def set_device_parameter(
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
+
+
+@mcp.tool()
+def set_parameter_by_display_value(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameter_index: int,
+    target: str,
+) -> str:
+    """
+    Set a device parameter using its DISPLAYED value instead of a raw 0.0-1.0
+    number. Pass the value the way Live shows it -- e.g. "-9 dB", "120 Hz",
+    "4:1", "0.03 ms" (a leading Unicode minus is accepted). Live resolves it via
+    its own str_to_value when supported, otherwise a str_for_value binary search
+    capped at 12 iterations. The result reports which method was used and the
+    raw + display value Live actually landed on, so you can confirm the match.
+
+    Use this whenever you know the target in musical/engineering units and don't
+    want to reverse-engineer the parameter's non-linear curve.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    - parameter_index: position of the parameter in the device (0-based)
+    - target: the display value as a string, e.g. "-9 dB", "120 Hz", "4:1"
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_parameter_by_display_value", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+            "target": target,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting parameter by display value: {str(e)}")
+        return f"Error setting parameter by display value: {str(e)}"
 
 
 @mcp.tool()

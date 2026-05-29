@@ -430,6 +430,7 @@ class AbletonMCP(ControlSurface):
             "delete_track":           lambda p: self._delete_track(p.get("track_index", 0)),
             "set_master_volume":      lambda p: self._set_master_volume(p.get("volume", 0.85)),
             "set_device_parameter":   lambda p: self._set_device_parameter(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0), p.get("value", 0.0)),
+            "set_parameter_by_display_value": lambda p: self._set_parameter_by_display_value(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0), p.get("target", "")),
             "create_scene":           lambda p: self._create_scene(p.get("index", -1)),
             "set_scene_name":         lambda p: self._set_scene_name(p.get("scene_index", 0), p.get("name", "")),
             "set_scene_tempo":        lambda p: self._set_scene_tempo(p.get("scene_index", 0), p.get("tempo", 120.0)),
@@ -1854,6 +1855,36 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting device displayed parameters: " + str(e))
+            raise
+
+    def _set_parameter_by_display_value(self, track_index, device_index, parameter_index, target):
+        """Set a device parameter from a human display value ('-9 dB', '120 Hz',
+        '4:1', '0.03 ms', Unicode minus accepted). Uses Live's str_to_value when
+        available, else a str_for_value binary search (<= 12 iterations); the
+        resolved raw value is clamped to the parameter's range before applying.
+        Returns the requested target, the method used, and the resulting raw +
+        display value so the caller can confirm what Live actually landed on."""
+        try:
+            track, device, param = self._get_param(track_index, device_index, parameter_index)
+            if not getattr(param, "is_enabled", True):
+                raise Exception("Parameter '{0}' is not enabled".format(param.name))
+            raw, method = _resolve_param_raw(param, target, max_iter=12)
+            param.value = max(param.min, min(param.max, float(raw)))
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_index": parameter_index,
+                "parameter_name": param.name,
+                "requested": _normalize_display_target(target),
+                "method": method,
+                "raw_value": param.value,
+                "display_value": self._safe_display_value(param),
+                "min": param.min,
+                "max": param.max,
+            }
+        except Exception as e:
+            self.log_message("Error setting parameter by display value: " + str(e))
             raise
 
     # ----- Tier 5 arrangement view (BETA, capability-probed) -----
