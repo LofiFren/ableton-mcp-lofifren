@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import traceback
+import re
 
 # Change queue import for Python 2
 try:
@@ -22,6 +23,162 @@ HOST = "localhost"
 # bursts of repeated loads in a session, short enough that a browser rescan
 # (new plugin installed, packs refreshed) gets picked up without restart.
 URI_CACHE_TTL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# Display-value helpers (pure: no Live dependency, unit-testable offline).
+#
+# MCP sets parameters as raw 0.0-1.0 (or a device's raw min..max), but Live
+# DISPLAYS them through a non-linear curve as dB/Hz/ms/ratios. These helpers
+# bridge a human display target ("-9 dB", "120 Hz", "4:1") to a raw value using
+# the parameter's own str_for_value()/str_to_value(), so callers never have to
+# reverse-engineer the curve. Kept at module scope (not on the ControlSurface
+# class) so they import without _Framework and can be exercised from a plain
+# Python process -- see scripts/test_param_display.py.
+# ---------------------------------------------------------------------------
+
+# Unicode minus (U+2212) and common dashes that keyboards / locales emit in
+# place of ASCII '-', so "-9 dB" parses regardless of which the user typed.
+_MINUS_CHARS = u"−‒–—―"
+
+_NUMBER_RE = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+
+
+def _normalize_display_target(s):
+    """Normalise a human-entered display string: coerce to text, map Unicode
+    minus/dash variants to ASCII '-', and strip surrounding whitespace. Does
+    NOT lowercase or strip units -- Live's str_to_value wants the unit text
+    intact (e.g. '-9 dB')."""
+    if s is None:
+        return ""
+    text = s if isinstance(s, str) else str(s)
+    for ch in _MINUS_CHARS:
+        text = text.replace(ch, "-")
+    return text.strip()
+
+
+def _parse_display_number(s):
+    """Parse a Live display string into a single float in a CANONICAL unit so
+    two displays of the same parameter compare monotonically during binary
+    search. Returns None when no number is present.
+
+    Canonicalises the unit switches Live makes across a parameter's range:
+      - frequency: kHz -> Hz    ("1.20 kHz" -> 1200.0)
+      - time:      s/us/ns -> ms ("1.5 s" -> 1500.0, "30 us" -> 0.03)
+      - ratio:     "a:b" -> a/b  ("4.00:1" -> 4.0)
+      - infinity:  "-inf dB" -> -1e30, "inf" -> 1e30  (volume floor/ceiling)
+    Other units (dB, %, st, ...) pass the number through unscaled. Used only
+    for ORDERING in the binary search, so relative monotonicity matters, not
+    physically exact conversion."""
+    if s is None:
+        return None
+    text = _normalize_display_target(s).lower()
+    if not text:
+        return None
+    # Infinity (volume floor/ceiling) -- the number regex won't match "inf".
+    if "inf" in text:
+        return -1e30 if "-" in text else 1e30
+    # Ratio "a:b" -> a/b.
+    if ":" in text:
+        parts = text.split(":")
+        a = _NUMBER_RE.search(parts[0])
+        b = _NUMBER_RE.search(parts[1]) if len(parts) > 1 else None
+        if a and b:
+            try:
+                bval = float(b.group())
+                if bval != 0.0:
+                    return float(a.group()) / bval
+            except ValueError:
+                pass
+        # fall through to a plain-number parse if the ratio didn't resolve
+    m = _NUMBER_RE.search(text)
+    if not m:
+        return None
+    try:
+        value = float(m.group())
+    except ValueError:
+        return None
+    # Unit -> canonical multiplier. Order matters: test qualified units first
+    # (kHz before Hz; ms/us/ns before bare seconds).
+    if "khz" in text:
+        return value * 1000.0
+    if "hz" in text:
+        return value
+    if "ms" in text:
+        return value
+    if "us" in text or u"µs" in text:   # microseconds (µs)
+        return value / 1000.0
+    if "ns" in text:
+        return value / 1000000.0
+    if re.search(r"\d\s*s\b", text):         # bare seconds (not ms/us/ns/Hz/st)
+        return value * 1000.0
+    return value
+
+
+def _binary_search_raw(param, target_num, max_iter=12):
+    """Find the raw value in [param.min, param.max] whose displayed value (via
+    param.str_for_value) is closest to target_num (a canonical number from
+    _parse_display_number). Detects curve direction from the endpoints, then
+    bisects -- capped at max_iter iterations. Returns the best raw float seen.
+
+    Raises ValueError if the endpoints don't yield parseable display numbers
+    (can't establish ordering); the caller should fall back to a raw set."""
+    lo = float(param.min)
+    hi = float(param.max)
+    if hi == lo:
+        return lo
+    if hi < lo:
+        lo, hi = hi, lo
+    lo_num = _parse_display_number(param.str_for_value(lo))
+    hi_num = _parse_display_number(param.str_for_value(hi))
+    if lo_num is None or hi_num is None:
+        raise ValueError("parameter display values are not numeric; cannot binary-search")
+    increasing = hi_num >= lo_num
+    best_raw = lo
+    best_err = None
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        cur = _parse_display_number(param.str_for_value(mid))
+        if cur is None:
+            break
+        err = abs(cur - target_num)
+        if best_err is None or err < best_err:
+            best_err = err
+            best_raw = mid
+        if cur == target_num:
+            return mid
+        go_up = (cur < target_num) if increasing else (cur > target_num)
+        if go_up:
+            lo = mid
+        else:
+            hi = mid
+    return best_raw
+
+
+def _resolve_param_raw(param, target, max_iter=12):
+    """Resolve a human display target ('-9 dB', '4:1', '120 Hz') to a raw value
+    for `param`. Tries param.str_to_value first (Live's own exact inverse);
+    falls back to a str_for_value binary search. Returns (raw, method) where
+    method is 'str_to_value' or 'binary_search'. Raises ValueError if neither
+    path resolves. Does not clamp -- the caller clamps to param.min/max."""
+    normalized = _normalize_display_target(target)
+    if not normalized:
+        raise ValueError("empty display target")
+    # 1) Exact inverse, if this Live version exposes it on the parameter.
+    fn = getattr(param, "str_to_value", None)
+    if callable(fn):
+        try:
+            raw = float(fn(normalized))
+            if raw == raw and raw not in (float("inf"), float("-inf")):  # finite
+                return raw, "str_to_value"
+        except Exception:
+            pass
+    # 2) Binary search on the forward display function.
+    target_num = _parse_display_number(normalized)
+    if target_num is None:
+        raise ValueError("could not parse a number from display target: {0!r}".format(target))
+    raw = _binary_search_raw(param, target_num, max_iter=max_iter)
+    return raw, "binary_search"
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
