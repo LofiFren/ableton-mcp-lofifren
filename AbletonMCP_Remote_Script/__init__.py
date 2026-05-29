@@ -389,6 +389,7 @@ class AbletonMCP(ControlSurface):
             "search_browser":            lambda p: self._search_browser(p.get("query", ""), p.get("category", "all"), p.get("prefer_preset", True), p.get("max_results", 50)),
             "browse_for_role":           lambda p: self._browse_for_role(p.get("role", "lead"), p.get("max_results", 15)),
             "get_track_devices":         lambda p: self._get_track_devices(p.get("track_index", 0)),
+            "get_parameter_display_value":     lambda p: self._get_parameter_display_value(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0)),
             # Tier 5 arrangement view (read-only ones)
             "arrangement_capabilities":  lambda p: self._arrangement_capabilities(),
             "get_arrangement_info":      lambda p: self._get_arrangement_info(),
@@ -1760,6 +1761,67 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting track devices: " + str(e))
+            raise
+
+    # ----- Parameter display-value tools -----
+    # Live exposes parameters as raw floats but DISPLAYS them through a
+    # non-linear curve (dB/Hz/ms/ratio). These read/write that display layer via
+    # the parameter's own str_for_value()/str_to_value(); resolution logic lives
+    # in the module-level _resolve_param_raw / _parse_display_number helpers.
+
+    def _get_param(self, track_index, device_index, parameter_index):
+        """Validate indices and return (track, device, param). Raises IndexError
+        with a clear message on any out-of-range index. Shared by the parameter
+        display-value tools."""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range (track has {0} devices)".format(len(track.devices)))
+        device = track.devices[device_index]
+        if parameter_index < 0 or parameter_index >= len(device.parameters):
+            raise IndexError("Parameter index out of range (device has {0} parameters)".format(len(device.parameters)))
+        return track, device, device.parameters[parameter_index]
+
+    def _safe_display_value(self, param, value=None):
+        """Return param.str_for_value(value) as a str, or None if Live can't
+        render it. Defaults to the parameter's current value."""
+        try:
+            if value is None:
+                value = param.value
+            return str(param.str_for_value(value))
+        except Exception:
+            return None
+
+    def _param_display_entry(self, param, index):
+        """Build the display dict for one parameter (single + batch getters)."""
+        entry = {
+            "index": index,
+            "name": param.name,
+            "raw_value": param.value,
+            "display_value": self._safe_display_value(param),
+            "min": param.min,
+            "max": param.max,
+        }
+        try:
+            entry["is_quantized"] = bool(getattr(param, "is_quantized", False))
+            entry["is_enabled"] = bool(getattr(param, "is_enabled", True))
+        except Exception:
+            pass
+        return entry
+
+    def _get_parameter_display_value(self, track_index, device_index, parameter_index):
+        """Read one device parameter: raw value plus Live's displayed value
+        (dB/Hz/ms/ratio/etc.) and the parameter's name and range."""
+        try:
+            track, device, param = self._get_param(track_index, device_index, parameter_index)
+            entry = self._param_display_entry(param, parameter_index)
+            entry["track_index"] = track_index
+            entry["device_index"] = device_index
+            entry["device_name"] = device.name
+            return entry
+        except Exception as e:
+            self.log_message("Error getting parameter display value: " + str(e))
             raise
 
     # ----- Tier 5 arrangement view (BETA, capability-probed) -----

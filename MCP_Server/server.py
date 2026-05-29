@@ -1856,6 +1856,38 @@ def get_track_devices(ctx: Context, track_index: int) -> str:
         return f"Error getting track devices: {str(e)}"
 
 
+@mcp.tool()
+def get_parameter_display_value(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameter_index: int,
+) -> str:
+    """
+    Read a single device parameter and return BOTH its raw Live value and the
+    value as Live DISPLAYS it (e.g. dB, Hz, ms, ratio). Live maps raw 0.0-1.0
+    (or a device's raw min..max) through a non-linear curve for display, so the
+    raw number alone is not human-meaningful. Returns name, raw_value,
+    display_value, min, and max.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    - parameter_index: position of the parameter in the device (0-based)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_parameter_display_value", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting parameter display value: {str(e)}")
+        return f"Error getting parameter display value: {str(e)}"
+
+
 # =====================================================================
 # Tier 1 — Composite "song scaffold" tools (built on send_batch)
 # =====================================================================
