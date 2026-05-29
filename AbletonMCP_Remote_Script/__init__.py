@@ -390,6 +390,7 @@ class AbletonMCP(ControlSurface):
             "browse_for_role":           lambda p: self._browse_for_role(p.get("role", "lead"), p.get("max_results", 15)),
             "get_track_devices":         lambda p: self._get_track_devices(p.get("track_index", 0)),
             "get_parameter_display_value":     lambda p: self._get_parameter_display_value(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0)),
+            "get_device_displayed_parameters": lambda p: self._get_device_displayed_parameters(p.get("track_index", 0), p.get("device_index", 0)),
             # Tier 5 arrangement view (read-only ones)
             "arrangement_capabilities":  lambda p: self._arrangement_capabilities(),
             "get_arrangement_info":      lambda p: self._get_arrangement_info(),
@@ -1822,6 +1823,37 @@ class AbletonMCP(ControlSurface):
             return entry
         except Exception as e:
             self.log_message("Error getting parameter display value: " + str(e))
+            raise
+
+    def _get_device_displayed_parameters(self, track_index, device_index):
+        """Batch read every parameter of a device, each with its display value.
+        A parameter that throws on access is reported as <unreadable> with null
+        values so the index list stays aligned with get_track_devices."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range (track has {0} devices)".format(len(track.devices)))
+            device = track.devices[device_index]
+            params = []
+            for p_index, param in enumerate(device.parameters):
+                try:
+                    params.append(self._param_display_entry(param, p_index))
+                except Exception:
+                    params.append({
+                        "index": p_index, "name": "<unreadable>", "raw_value": None,
+                        "display_value": None, "min": None, "max": None,
+                    })
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_count": len(params),
+                "parameters": params,
+            }
+        except Exception as e:
+            self.log_message("Error getting device displayed parameters: " + str(e))
             raise
 
     # ----- Tier 5 arrangement view (BETA, capability-probed) -----

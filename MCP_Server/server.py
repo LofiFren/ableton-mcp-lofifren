@@ -1888,6 +1888,35 @@ def get_parameter_display_value(
         return f"Error getting parameter display value: {str(e)}"
 
 
+@mcp.tool()
+def get_device_displayed_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+) -> str:
+    """
+    Read EVERY parameter of a device, each with both its raw Live value and the
+    value as Live displays it (dB/Hz/ms/ratio/etc.). This is the batch version
+    of get_parameter_display_value -- use it to see a whole device's settings in
+    human-readable units in one call. Returns the device name and a list of
+    parameters with index, name, raw_value, display_value, min, and max.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_displayed_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting device displayed parameters: {str(e)}")
+        return f"Error getting device displayed parameters: {str(e)}"
+
+
 # =====================================================================
 # Tier 1 — Composite "song scaffold" tools (built on send_batch)
 # =====================================================================
