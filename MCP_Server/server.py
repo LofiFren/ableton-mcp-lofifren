@@ -33,6 +33,7 @@ MODIFYING_COMMANDS = {
     "duplicate_clip_cross_track",
     # Tier 5 arrangement view (BETA)
     "add_clip_to_arrangement", "set_arrangement_loop", "add_arrangement_locator",
+    "clear_all_arrangement_locators", "delete_arrangement_locator",
 }
 
 
@@ -2149,6 +2150,39 @@ def add_arrangement_locator(ctx: Context, time: float, name: str = "") -> str:
     except Exception as e:
         logger.error(f"Error adding arrangement locator: {str(e)}")
         return f"Error adding arrangement locator: {str(e)}"
+
+
+@mcp.tool()
+def clear_all_arrangement_locators(ctx: Context) -> str:
+    """
+    BETA: Delete every locator (cue point) from the arrangement. Iterates the
+    cues one at a time on Live's main thread and returns how many were cleared.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("clear_all_arrangement_locators")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error clearing arrangement locators: {str(e)}")
+        return f"Error clearing arrangement locators: {str(e)}"
+
+
+@mcp.tool()
+def delete_arrangement_locator(ctx: Context, time: float, tolerance: float = 0.05) -> str:
+    """
+    BETA: Delete a single locator (cue point) at the given arrangement time
+    (in beats). Finds the nearest cue within `tolerance` beats, moves the
+    playhead onto it (with the same commit-and-retry guard as
+    add_arrangement_locator), and toggles it off. Errors if no locator is
+    within tolerance of `time`.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_arrangement_locator", {"time": time, "tolerance": tolerance})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting arrangement locator: {str(e)}")
+        return f"Error deleting arrangement locator: {str(e)}"
 
 
 @mcp.tool()
