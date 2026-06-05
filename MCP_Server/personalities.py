@@ -518,6 +518,28 @@ PERSONALITIES: Dict[str, Dict[str, Any]] = {
         "swing": 0.62,
         "description": "Expressive upright walking — dramatic dynamics, chromatic excursions, slides, syncopation",
     },
+    "house": {
+        "role": "bass",
+        "name": "House",                         # genre profile — deliberately not a real player
+        "instrument_hint": "house bass (sub / analog synth bass)",
+        "tempo_sweet_spot": 124,
+        "tempo_min": 118,
+        "tempo_max": 130,
+        "walking_density": "low",                # unused on the rhythm_pattern path; kept for schema parity
+        "range": (28, 48),                       # E1-C3 — house bass lives ~C1-C2, cap at C3
+        "register_preference": "low",
+        "ghost_note_chance": 0.0,
+        "slide_chance": 0.0,
+        "chord_tone_priority": 0.9,              # root-dominant on the rhythm_pattern path
+        "velocity_range": (66, 74),              # moderate, not hot
+        "syncopation": 0.0,
+        "swing": 0.5,
+        # Off-beat placement — notes on the "and" of each beat, sitting between
+        # four-on-the-floor kicks and deliberately avoiding beat 1. 0.4-beat
+        # duration gives the note body without overlapping the next.
+        "rhythm_pattern": [(0.5, 0.4), (1.5, 0.4), (2.5, 0.4), (3.5, 0.4)],
+        "description": "Off-beat house bass — root-dominant, low register, lands on the upbeats, monophonic",
+    },
 
     # ============== DRUMS ==============
 
@@ -822,6 +844,7 @@ BROWSER_HINTS: Dict[str, List[str]] = {
     "marcus_miller":    ["slap bass", "funk bass", "jazz bass", "bass"],
     "ray_brown":        ["upright bass", "double bass", "acoustic bass", "jazz bass", "bass"],
     "charles_mingus":   ["upright bass", "double bass", "acoustic bass", "bass"],
+    "house":            ["bass", "sub bass", "analog bass", "synth bass", "house bass"],
 
     # ===== drums (acoustic) =====
     "questlove":        ["drum rack", "acoustic kit", "vintage kit", "soul kit"],
@@ -1322,6 +1345,34 @@ def _generate_bass_impl(
         else:
             roots_in_pref = [p for p in roots if p in valid_pitches] or roots
             root_pitch = min(roots_in_pref) if roots_in_pref else min(valid_pitches)
+
+        # --- Additive placement path: explicit rhythm_pattern (e.g. House) ---
+        # If the profile declares a (beat_pos, duration) list, honor it instead
+        # of the even grid. This is the off-beat / non-walking path: it does NOT
+        # force the root onto beat 1 — notes land exactly where the pattern says.
+        # Pitch is root-dominant here: chord_tone_priority biases toward the
+        # ROOT (house bass is mostly the root), falling back to other chord
+        # tones. Monophonic — one note per (beat_pos, duration) entry. No swing /
+        # syncopation nudges; positions are exact. Mirrors comp's per-bar
+        # convention: t = bar_start + beat_pos, authored within a single 4/4 bar.
+        rhythm_pattern = profile.get("rhythm_pattern")
+        if rhythm_pattern:
+            for beat_pos, dur in rhythm_pattern:
+                t = bar_start + beat_pos
+                if rng.random() < chord_tone_pri:
+                    pitch = root_pitch
+                else:
+                    pitch = rng.choice(chord_pitches)
+                vel_pos = 0.55 + (rng.random() - 0.5) * 0.1
+                velocity = velocity_lo + int((velocity_hi - velocity_lo) * vel_pos)
+                notes.append({
+                    "pitch": int(pitch),
+                    "start_time": float(t),
+                    "duration": float(dur),
+                    "velocity": int(max(1, min(127, velocity))),
+                    "mute": False,
+                })
+            continue  # this chord is fully placed; skip the grid engine below
 
         n_steps = max(1, int(bar_beats / step))
         for step_idx in range(n_steps):
