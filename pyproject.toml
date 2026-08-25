@@ -1,6 +1,6 @@
 [project]
 name = "ableton-mcp-lofifren"
-version = "1.1.0"
+version = "1.2.0"
 description = "Ableton Live MCP integration — fork of ahujasid/ableton-mcp adding a 33-personality style system, ~35 extra MCP tools, batch commands, and arrangement-view BETA"
 readme = "README.md"
 requires-python = ">=3.10"
