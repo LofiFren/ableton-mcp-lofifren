@@ -143,6 +143,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 - **`add_arrangement_locator(time, name)`** — Verse / chorus / bridge markers. **⚠ KNOWN ISSUE — partially working:** the rename path (when a cue already exists at the target time) is reliable, but creating a brand-new cue at an arbitrary timeline position is flaky due to a Live API quirk where `Song.current_song_time = X` writes don't always commit before `Song.set_or_delete_cue()` reads the play head, even with chained `schedule_message` callbacks. Workaround: use `⌘L` in Ableton to add locators manually at the play head position (Live's native shortcut bypasses the API).
 - **`clear_all_arrangement_locators`** — Tries to delete every cue point. Same caveat as `add_arrangement_locator` — works for cues that the play head actually lands on, doesn't reliably delete every cue.
 - **`bounce_session_to_arrangement(scene_order, bar_length?)`** — BETA. Renders a sequence of scenes onto the arrangement timeline as a one-call session-sketch → arrangement workflow. Requires `can_duplicate_to_arrangement: true` in `get_arrangement_info`.
+- **`render_arrangement_to_wav(track_index, start_beat, end_beat, out_path?, tail_seconds?)`** — Headless bounce-to-disk: renders an Arrangement region straight to a `.wav` with no manual Export Audio/Video step. Live's LOM has no export-to-file call, so this arms an audio track on the built-in Resampling input (master bus, post-fader, no feedback loop) and records a real-time Arrangement pass, then reads the resulting clip's file path and restores the track's prior input/arm state. Blocks server-side for roughly the real-time duration of the region plus `tail_seconds`.
 
 ### Tier 6 — Infrastructure & quality of life
 
@@ -156,6 +157,8 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 
 - Fixed a timeout race that could affect destructive commands; `get_clip_notes` runs via direct execution.
 - `load_browser_item` is correctly recognized as a modifying command.
+- `load_browser_item` correctly resolves plugin URIs by walking plugins / Max for Live / user library / packs / samples in `_find_browser_item_by_uri`, so URIs returned by `get_browser_items_at_path` actually load.
+- The browser URI cache now stores a soft 5-minute TTL per entry and validates the cached item before returning it, so a stale reference after a browser rescan is evicted instead of silently breaking `load_item`.
 
 ## Features
 
@@ -172,6 +175,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 - **Mixer control**: Track and master volume, pan, and return-track sends
 - **Session control**: Start/stop playback, fire individual clips or whole scenes, create scenes
 - **Arrangement view (BETA)**: Capability-probed support for dropping clips onto the timeline, setting the arrangement loop, adding locators, and bouncing a scene order to a full arrangement
+- **Headless bounce-to-disk**: Render an Arrangement region straight to a `.wav` file with no manual Export Audio/Video step
 - **Undo support**: Revert the last action — including a whole batch as one step
 
 ## Components
