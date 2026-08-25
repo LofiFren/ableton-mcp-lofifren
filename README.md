@@ -20,6 +20,8 @@ This fork extends the upstream [`ahujasid/ableton-mcp`](https://github.com/ahuja
 
 - **`setup_session(tempo, time_signature, tracks=[…])`** — Bootstrap an entire session in a single round-trip: tempo, time signature, plus N tracks each with optional name, instrument, volume, and pan.
 - **`create_clip_with_notes(track, clip, length, notes, name?)`** — Fuses `create_clip` + `add_notes_to_clip` + `set_clip_name`.
+- **`create_clips_with_notes(clips=[…])`** — Bulk form of `create_clip_with_notes`, creating and naming multiple MIDI clips in one remote batch for multi-part song sketches.
+- **`generate_personality_clip(track, clip, personality, chord_progression, ...)`** — One-shot personality workflow: create the clip, generate the part, write notes, and optionally name the clip.
 - **`create_track(type, name?, instrument_uri?, volume?, pan?, index?)`** — Single-call replacement for the create → name → load chain.
 - **`duplicate_clip(src_track, src_slot, dst_track, dst_slot)`** — Cross-track clip duplication. (Upstream's `duplicate_clip_to` only works within a single track.)
 
@@ -136,6 +138,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 
 - **`get_arrangement_info`** — Reports capability detection, song length, loop region, locators, and per-track arrangement clips.
 - **`add_clip_to_arrangement(track, slot, time)`** — BETA. Drops a session clip onto the arrangement timeline. Capability-probed: returns a structured "unsupported" error on Live versions that don't expose `Track.duplicate_clip_to_arrangement`. **Verified working on Live 12.2.7.**
+- **`arrange_clips(placements=[…], loop_start?, loop_end?, loop_on?)`** — Bulk form of `add_clip_to_arrangement`, with optional arrangement-loop setup for placing a whole section map in one remote batch.
 - **`set_arrangement_loop(start, end, on)`** — Stable across Live 11+.
 - **`add_arrangement_locator(time, name)`** — Verse / chorus / bridge markers. **⚠ KNOWN ISSUE — partially working:** the rename path (when a cue already exists at the target time) is reliable, but creating a brand-new cue at an arbitrary timeline position is flaky due to a Live API quirk where `Song.current_song_time = X` writes don't always commit before `Song.set_or_delete_cue()` reads the play head, even with chained `schedule_message` callbacks. Workaround: use `⌘L` in Ableton to add locators manually at the play head position (Live's native shortcut bypasses the API).
 - **`clear_all_arrangement_locators`** — Tries to delete every cue point. Same caveat as `add_arrangement_locator` — works for cues that the play head actually lands on, doesn't reliably delete every cue.
@@ -143,7 +146,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 
 ### Tier 6 — Infrastructure & quality of life
 
-- **`batch_commands(commands)`** — Send N commands in one socket round-trip. The whole batch executes inside a single main-thread closure on Live's side, so it's atomic from Live's perspective and a single subsequent `undo` reverts the entire sequence. Stops on the first failure and returns partial results.
+- **`batch_commands(commands)`** — Send N remote primitive commands in one socket round-trip. The whole batch executes inside a single main-thread closure on Live's side, so it's atomic from Live's perspective and a single subsequent `undo` reverts the entire sequence. Stops on the first failure and returns partial results. Server-side composite tools such as `create_clip_with_notes` and `generate_personality_clip` are not valid inside `batch_commands`; use their bulk forms instead.
 - **Warm-path auto-reconnect** — `send_command` retries once on `BrokenPipeError` / `ConnectionResetError` so a brief Ableton restart no longer breaks the session.
 - **Auto-extending clips** — `add_notes_to_clip` now extends the clip's `end_marker` if any of the supplied notes would otherwise be truncated. **This is a behavior change** vs upstream, which silently dropped notes past the clip end.
 - **Extended `get_session_info`** — Now also reports `scene_count`, `scene_names`, `is_playing`, `current_song_time`, and `arrangement_length`.
@@ -158,6 +161,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 
 - **Two-way communication**: Connect Claude AI to Ableton Live through a socket-based server
 - **One-call session bootstrap**: `setup_session` creates a whole project (tempo, time sig, tracks, instruments, mix) in a single round-trip
+- **Bulk song sketching**: `create_clips_with_notes`, `generate_personality_clip`, and `arrange_clips` reduce multi-track song-building to a few calls
 - **Batched commands**: send N commands at once with atomic undo via `batch_commands`
 - **33 personalities, 4 roles**: solo / comp / bass / drums in the style of Coltrane, Bill Evans, Jaco, Questlove, Timbaland, Dr. Dre, Metro Boomin, etc. — BPM-aware, blendable
 - **Track manipulation**: Create, name, mute, solo, arm, delete, and mix MIDI/audio tracks

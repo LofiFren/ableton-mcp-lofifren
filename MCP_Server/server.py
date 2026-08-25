@@ -33,6 +33,8 @@ MODIFYING_COMMANDS = {
     "duplicate_clip_cross_track",
     # Tier 5 arrangement view (BETA)
     "add_clip_to_arrangement", "set_arrangement_loop", "add_arrangement_locator",
+    # Headless bounce-to-disk
+    "render_arrangement_start", "render_arrangement_stop",
 }
 
 
@@ -1957,6 +1959,160 @@ def create_clip_with_notes(
 
 
 @mcp.tool()
+def create_clips_with_notes(
+    ctx: Context,
+    clips: List[Dict[str, Any]],
+) -> str:
+    """
+    Create and populate multiple MIDI clips in one remote batch.
+
+    Parameters:
+    - clips: list of clip specs. Each spec must contain:
+        - track_index: target track
+        - clip_index: target clip slot
+        - length: clip length in beats
+        - notes: list of note dicts {pitch, start_time, duration, velocity?, mute?}
+        - name: optional clip name
+
+    This is the bulk form of ``create_clip_with_notes`` and is intended for
+    song-sketch workflows where several parts are authored at once.
+    """
+    try:
+        if not clips:
+            return "clips must contain at least one clip spec"
+
+        commands: List[Dict[str, Any]] = []
+        for index, spec in enumerate(clips):
+            missing = [key for key in ("track_index", "clip_index", "length", "notes") if key not in spec]
+            if missing:
+                return f"clips[{index}] is missing required keys: {', '.join(missing)}"
+            track_index = int(spec["track_index"])
+            clip_index = int(spec["clip_index"])
+            length = float(spec["length"])
+            notes = spec["notes"]
+            if not isinstance(notes, list):
+                return f"clips[{index}].notes must be a list"
+
+            commands.append({"type": "create_clip", "params": {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "length": length,
+            }})
+            commands.append({"type": "add_notes_to_clip", "params": {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "notes": notes,
+            }})
+            if spec.get("name") is not None:
+                commands.append({"type": "set_clip_name", "params": {
+                    "track_index": track_index,
+                    "clip_index": clip_index,
+                    "name": str(spec["name"]),
+                }})
+
+        ableton = get_ableton_connection()
+        result = ableton.send_batch(commands)
+        return json.dumps({
+            "clips_requested": len(clips),
+            "commands_submitted": len(commands),
+            "batch": result,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error in create_clips_with_notes: {str(e)}")
+        return f"Error in create_clips_with_notes: {str(e)}"
+
+
+@mcp.tool()
+def generate_personality_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    personality: str,
+    chord_progression: List[str],
+    bars_per_chord: int = 1,
+    tempo: Optional[float] = None,
+    octave_offset: int = 0,
+    seed: Optional[int] = None,
+    name: Optional[str] = None,
+    length: Optional[float] = None,
+) -> str:
+    """
+    Create a clip, generate a personality part, write notes, and optionally
+    name the clip in one call.
+
+    Parameters:
+    - track_index, clip_index: target clip location
+    - personality: one of the keys returned by ``list_personalities``
+    - chord_progression: list of chord symbols
+    - bars_per_chord: how many 4/4 bars each chord lasts
+    - tempo: optional BPM override; defaults to the current Live tempo
+    - octave_offset: shift natural register up/down N octaves
+    - seed: optional RNG seed
+    - name: optional clip name
+    - length: optional clip length in beats. Defaults to
+      ``len(chord_progression) * bars_per_chord * 4``.
+    """
+    try:
+        if not chord_progression:
+            return "chord_progression must contain at least one chord"
+        if bars_per_chord <= 0:
+            return "bars_per_chord must be greater than zero"
+
+        ableton = get_ableton_connection()
+        actual_tempo = _resolve_session_tempo(ableton, tempo)
+        notes, warning = _personalities.generate_personality_part(
+            personality=personality,
+            chord_progression=chord_progression,
+            bars_per_chord=bars_per_chord,
+            tempo=actual_tempo,
+            octave_offset=octave_offset,
+            seed=seed,
+        )
+        if not notes:
+            return json.dumps({
+                "personality": personality,
+                "warning": warning,
+                "error": "Generator produced no notes",
+            }, indent=2)
+
+        clip_length = float(length) if length is not None else float(len(chord_progression) * bars_per_chord * 4)
+        commands: List[Dict[str, Any]] = [
+            {"type": "create_clip", "params": {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "length": clip_length,
+            }},
+            {"type": "add_notes_to_clip", "params": {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "notes": notes,
+            }},
+        ]
+        if name is not None:
+            commands.append({"type": "set_clip_name", "params": {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "name": name,
+            }})
+
+        batch_result = ableton.send_batch(commands)
+        profile = _personalities.PERSONALITIES[personality.strip().lower().replace(" ", "_")]
+        return json.dumps({
+            "personality": profile["name"],
+            "role": profile["role"],
+            "note_count": len(notes),
+            "tempo": actual_tempo,
+            "warning": warning,
+            "instrument_hint": profile.get("instrument_hint"),
+            "clip_length": clip_length,
+            "batch": batch_result,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error in generate_personality_clip: {str(e)}")
+        return f"Error in generate_personality_clip: {str(e)}"
+
+
+@mcp.tool()
 def duplicate_clip(
     ctx: Context,
     src_track: int,
@@ -2118,6 +2274,89 @@ def add_clip_to_arrangement(
 
 
 @mcp.tool()
+def arrange_clips(
+    ctx: Context,
+    placements: List[Dict[str, Any]],
+    loop_start: Optional[float] = None,
+    loop_end: Optional[float] = None,
+    loop_on: bool = True,
+) -> str:
+    """
+    BETA: Copy many session clips onto the arrangement timeline in one
+    remote batch, with optional arrangement-loop setup.
+
+    Parameters:
+    - placements: list of placement specs. Each spec must contain:
+        - track_index: source track
+        - clip_slot_index: source clip slot
+        - arrangement_time: destination time in beats
+      ``slot`` and ``time`` are accepted as aliases for ``clip_slot_index`` and
+      ``arrangement_time``.
+    - loop_start, loop_end: optional arrangement loop bounds in beats. Provide
+      both or neither.
+    - loop_on: whether to enable the loop when loop bounds are provided.
+
+    This is the bulk form of ``add_clip_to_arrangement`` for arranging song
+    sections without repeated MCP round-trips.
+    """
+    try:
+        if not placements:
+            return "placements must contain at least one placement spec"
+        if (loop_start is None) != (loop_end is None):
+            return "loop_start and loop_end must be provided together"
+
+        ableton = get_ableton_connection()
+        info = ableton.send_command("get_arrangement_info")
+        if not info.get("capabilities", {}).get("can_duplicate_to_arrangement"):
+            return json.dumps({
+                "supported": False,
+                "reason": "This Live version does not expose Track.duplicate_clip_to_arrangement",
+            }, indent=2)
+
+        commands: List[Dict[str, Any]] = []
+        if loop_start is not None and loop_end is not None:
+            commands.append({"type": "set_arrangement_loop", "params": {
+                "start": float(loop_start),
+                "end": float(loop_end),
+                "loop_on": bool(loop_on),
+            }})
+
+        for index, spec in enumerate(placements):
+            if "track_index" not in spec:
+                return f"placements[{index}] is missing required key: track_index"
+            if "clip_slot_index" in spec:
+                clip_slot_index = spec["clip_slot_index"]
+            elif "slot" in spec:
+                clip_slot_index = spec["slot"]
+            else:
+                return f"placements[{index}] is missing required key: clip_slot_index"
+            if "arrangement_time" in spec:
+                arrangement_time = spec["arrangement_time"]
+            elif "time" in spec:
+                arrangement_time = spec["time"]
+            else:
+                return f"placements[{index}] is missing required key: arrangement_time"
+
+            commands.append({"type": "add_clip_to_arrangement", "params": {
+                "track_index": int(spec["track_index"]),
+                "clip_slot_index": int(clip_slot_index),
+                "arrangement_time": float(arrangement_time),
+            }})
+
+        batch_result = ableton.send_batch(commands)
+        return json.dumps({
+            "supported": True,
+            "placements_requested": len(placements),
+            "loop_requested": loop_start is not None,
+            "commands_submitted": len(commands),
+            "batch": batch_result,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error arranging clips: {str(e)}")
+        return f"Error arranging clips: {str(e)}"
+
+
+@mcp.tool()
 def set_arrangement_loop(ctx: Context, start: float, end: float, loop_on: bool = True) -> str:
     """
     Set the arrangement loop region (in beats) and whether the loop is
@@ -2220,6 +2459,88 @@ def bounce_session_to_arrangement(
     except Exception as e:
         logger.error(f"Error bouncing session to arrangement: {str(e)}")
         return f"Error bouncing session to arrangement: {str(e)}"
+
+
+@mcp.tool()
+def render_arrangement_to_wav(
+    ctx: Context,
+    track_index: int,
+    start_beat: float,
+    end_beat: float,
+    out_path: str = "",
+    tail_seconds: float = 1.0,
+) -> str:
+    """
+    Bounce a region of the Arrangement to a .wav file WITHOUT the user opening
+    Ableton's Export Audio/Video dialog.
+
+    Live's Object Model has no direct "export to file" call, so this does what
+    any headless Ableton render does under the hood: point an audio track's
+    input at Live's built-in 'Resampling' source (the master bus, post-fader,
+    with no feedback loop), arm it, and record an Arrangement pass in real
+    time. There is no faster-than-realtime bounce over this API, so the call
+    blocks for roughly (end_beat - start_beat) converted to seconds at the
+    session's current tempo, plus `tail_seconds` for the device tail/release
+    to finish ringing out before the recording is stopped.
+
+    Parameters:
+    - track_index: an AUDIO track (create one with create_audio_track if
+      needed) with your mix routed into it or reachable via Resampling
+    - start_beat / end_beat: the Arrangement region to bounce, in beats
+    - out_path: if given, the rendered wav is copied here (absolute or
+      relative to the MCP server's working directory). If omitted, only
+      Live's own recorded-file path is returned (typically inside the Live
+      Set's "Project/Samples/Recorded" folder) -- copy it yourself.
+    - tail_seconds: extra real-time recording padding after end_beat, so a
+      reverb/delay tail or the last note's release isn't truncated
+    """
+    try:
+        ableton = get_ableton_connection()
+
+        session = ableton.send_command("get_session_info")
+        tempo = float(session.get("tempo", 120.0)) or 120.0
+        duration_beats = float(end_beat) - float(start_beat)
+        if duration_beats <= 0:
+            return "Error: end_beat must be greater than start_beat"
+        duration_seconds = duration_beats * 60.0 / tempo + float(tail_seconds)
+
+        ableton.send_command("render_arrangement_start", {
+            "track_index": track_index,
+            "start_beat": start_beat,
+        })
+
+        import time
+        time.sleep(duration_seconds)
+
+        result = ableton.send_command("render_arrangement_stop")
+        file_path = result.get("file_path")
+
+        copied_to = None
+        if out_path and file_path:
+            import os
+            import shutil
+            resolved_out = os.path.abspath(out_path)
+            os.makedirs(os.path.dirname(resolved_out) or ".", exist_ok=True)
+            shutil.copy2(file_path, resolved_out)
+            copied_to = resolved_out
+
+        return json.dumps({
+            "recorded_seconds": round(duration_seconds, 3),
+            "tempo": tempo,
+            "live_file_path": file_path,
+            "copied_to": copied_to,
+            "clip": result,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error rendering arrangement to wav: {str(e)}")
+        # Best-effort cleanup: if start succeeded but something failed before
+        # stop, try to stop the recording so the track isn't left armed.
+        try:
+            ableton = get_ableton_connection()
+            ableton.send_command("render_arrangement_stop")
+        except Exception:
+            pass
+        return f"Error rendering arrangement to wav: {str(e)}"
 
 
 # Main execution

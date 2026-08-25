@@ -44,6 +44,9 @@ class AbletonMCP(ControlSurface):
         # Cache the song reference for easier access
         self._song = self.song()
 
+        # State for an in-progress render_arrangement_start/stop bounce (see below)
+        self._render_state = None
+
         # Build command dispatch tables (one entry per supported command)
         self._build_dispatch_tables()
 
@@ -283,6 +286,12 @@ class AbletonMCP(ControlSurface):
                 p.get("track_index", 0), p.get("clip_slot_index", 0), p.get("arrangement_time", 0.0)),
             "set_arrangement_loop":      lambda p: self._set_arrangement_loop(
                 p.get("start", 0.0), p.get("end", 4.0), p.get("loop_on", True)),
+            # Headless bounce-to-disk (no Export Audio/Video dialog needed): pair
+            # render_arrangement_start with render_arrangement_stop after waiting
+            # real time for the recording to complete.
+            "render_arrangement_start":  lambda p: self._render_arrangement_start(
+                p.get("track_index", 0), p.get("start_beat", 0.0)),
+            "render_arrangement_stop":   lambda p: self._render_arrangement_stop(),
         }
         # Async modifying commands chain main-thread closures via schedule_message
         # so Live can commit state between operations. Each handler takes
@@ -1651,6 +1660,111 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error adding clip to arrangement: " + str(e))
+            raise
+
+    def _render_arrangement_start(self, track_index, start_beat):
+        """Begin bouncing the Arrangement to disk without the user opening the
+        Export Audio/Video dialog. Live's LOM has no direct 'export to file'
+        call, so this works around it the way any headless Ableton render
+        does: switch an audio track's input to the built-in 'Resampling'
+        source (captures the master bus post-fader with no feedback loop),
+        arm it, and start an Arrangement recording pass. Pair with
+        _render_arrangement_stop once real time has elapsed to grab the
+        resulting clip's file_path. The caller is responsible for waiting
+        (end_beat - start_beat) worth of real seconds before stopping --
+        recording only happens in real time, there is no faster-than-realtime
+        bounce available over this API.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if not getattr(track, "has_audio_input", False):
+                raise Exception("Track index %d is not an audio track (Resampling input requires an audio track)" % track_index)
+            if not track.can_be_armed:
+                raise Exception("Track cannot be armed (likely a group/return/master track)")
+
+            resampling_type = None
+            for rt in track.available_input_routing_types:
+                if "resampl" in rt.display_name.lower():
+                    resampling_type = rt
+                    break
+            if resampling_type is None:
+                raise Exception("No 'Resampling' input routing type available on track %d's available_input_routing_types" % track_index)
+
+            # Remember prior state so _render_arrangement_stop can restore it.
+            self._render_state = {
+                "track_index": track_index,
+                "prev_routing_display_name": track.input_routing_type.display_name,
+                "prev_arm": track.arm,
+                "start_beat": float(start_beat),
+            }
+
+            track.input_routing_type = resampling_type
+            track.arm = True
+            self._song.record_mode = True
+            self._song.current_song_time = float(start_beat)
+            self._song.start_playing()
+
+            return {"recording": True, "track_index": track_index, "start_beat": float(start_beat)}
+        except Exception as e:
+            self.log_message("Error starting arrangement render: " + str(e))
+            self._render_state = None
+            raise
+
+    def _render_arrangement_stop(self):
+        """Stop the recording started by _render_arrangement_start, restore the
+        track's prior input routing/arm state, and return the resulting audio
+        clip's file_path (and timing) so the caller can pick the rendered wav
+        up off disk."""
+        try:
+            if not self._render_state:
+                raise Exception("No render in progress -- call render_arrangement_start first")
+            state = self._render_state
+            track_index = state["track_index"]
+            track = self._song.tracks[track_index]
+
+            self._song.stop_playing()
+            self._song.record_mode = False
+
+            clip_info = None
+            arr_clips = getattr(track, "arrangement_clips", None)
+            if arr_clips:
+                best = None
+                best_delta = None
+                for clip in arr_clips:
+                    delta = abs(getattr(clip, "start_time", 0.0) - state["start_beat"])
+                    if best_delta is None or delta < best_delta:
+                        best = clip
+                        best_delta = delta
+                if best is not None:
+                    clip_info = {
+                        "name": getattr(best, "name", ""),
+                        "start_time": getattr(best, "start_time", None),
+                        "end_time": getattr(best, "end_time", None),
+                        "length": getattr(best, "length", None),
+                        "file_path": getattr(best, "file_path", None),
+                    }
+
+            # Best-effort restore of the track's pre-render input/arm state.
+            try:
+                track.arm = state.get("prev_arm", False)
+                for rt in track.available_input_routing_types:
+                    if rt.display_name == state.get("prev_routing_display_name"):
+                        track.input_routing_type = rt
+                        break
+            except Exception as restore_err:
+                self.log_message("Warning: could not fully restore track input state: " + str(restore_err))
+
+            self._render_state = None
+
+            if not clip_info or not clip_info.get("file_path"):
+                raise Exception("Recording stopped but no audio clip / file_path was found on track %d" % track_index)
+
+            return clip_info
+        except Exception as e:
+            self.log_message("Error stopping arrangement render: " + str(e))
+            self._render_state = None
             raise
 
     def _set_arrangement_loop(self, start, end, loop_on):
