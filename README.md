@@ -39,6 +39,9 @@ This fork extends the upstream [`ahujasid/ableton-mcp`](https://github.com/ahuja
 - **`search_browser(query, category?)`** — Walk Ableton's browser tree by name (case-insensitive). Returns up to 50 matches with URIs ready to load.
 - **`load_instrument_by_name(track_index, name, category?)`** — Server-side composite: search + load in one call. No more URI hunting.
 - **`get_track_devices(track_index)`** — List the devices on a track plus every device's parameters with their value, min, and max — needed before calling `set_device_parameter`.
+- **`get_parameter_display_value(track, device, parameter)`** / **`get_device_displayed_parameters(track, device)`** — Read parameters as Live displays them (dB, Hz, ms, ratio) alongside the raw value.
+- **`set_parameter_by_display_value(track, device, parameter, target)`** — Set a parameter from a display string such as `"-9 dB"`, `"120 Hz"` or `"4:1"`. Uses Live's `str_to_value` when available, otherwise a bounded binary search on `str_for_value`.
+- **`set_track_volume_db(track, db_value)`** — Set a track fader in dB instead of a raw 0–1 float.
 
 ### Tier 4 — Musical helpers (pure server-side, no remote round-trips for note math)
 
@@ -98,6 +101,7 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 | `marcus_miller` | Marcus Miller | 100 BPM | Slap funk — hugely percussive 16ths with massive thumb/pop dynamics |
 | `ray_brown` | Ray Brown | 140 BPM | Straight quarter-note jazz walking, low register, locked-in |
 | `charles_mingus` | Charles Mingus | 130 BPM | Expressive upright walking — dramatic dynamics, chromatic, slides |
+| `house` | House (genre profile) | 124 BPM | Off-beat root-dominant synth bass on the "and" of every beat, low register, monophonic |
 
 **Drums (12)** — drum kit patterns
 
@@ -140,8 +144,9 @@ Each personality declares a `tempo_sweet_spot` and a comfortable `tempo_min`/`te
 - **`add_clip_to_arrangement(track, slot, time)`** — BETA. Drops a session clip onto the arrangement timeline. Capability-probed: returns a structured "unsupported" error on Live versions that don't expose `Track.duplicate_clip_to_arrangement`. **Verified working on Live 12.2.7.**
 - **`arrange_clips(placements=[…], loop_start?, loop_end?, loop_on?)`** — Bulk form of `add_clip_to_arrangement`, with optional arrangement-loop setup for placing a whole section map in one remote batch.
 - **`set_arrangement_loop(start, end, on)`** — Stable across Live 11+.
-- **`add_arrangement_locator(time, name)`** — Verse / chorus / bridge markers. **⚠ KNOWN ISSUE — partially working:** the rename path (when a cue already exists at the target time) is reliable, but creating a brand-new cue at an arbitrary timeline position is flaky due to a Live API quirk where `Song.current_song_time = X` writes don't always commit before `Song.set_or_delete_cue()` reads the play head, even with chained `schedule_message` callbacks. Workaround: use `⌘L` in Ableton to add locators manually at the play head position (Live's native shortcut bypasses the API).
-- **`clear_all_arrangement_locators`** — Tries to delete every cue point. Same caveat as `add_arrangement_locator` — works for cues that the play head actually lands on, doesn't reliably delete every cue.
+- **`add_arrangement_locator(time, name)`** — Verse / chorus / bridge markers. Drives the play head to `time` with a commit-and-retry guard (waits real control-surface ticks and re-asserts the position write until Live commits it), then toggles the cue. **Verified on Live 12.2.7:** consecutive calls land exactly where asked on the first try.
+- **`delete_arrangement_locator(time, tolerance=0.05)`** — Deletes the nearest locator within `tolerance` beats of `time`; errors if none is in range.
+- **`clear_all_arrangement_locators`** — Deletes every cue point one at a time and reports the count actually removed.
 - **`bounce_session_to_arrangement(scene_order, bar_length?)`** — BETA. Renders a sequence of scenes onto the arrangement timeline as a one-call session-sketch → arrangement workflow. Requires `can_duplicate_to_arrangement: true` in `get_arrangement_info`.
 - **`render_arrangement_to_wav(track_index, start_beat, end_beat, out_path?, tail_seconds?)`** — Headless bounce-to-disk: renders an Arrangement region straight to a `.wav` with no manual Export Audio/Video step. Live's LOM has no export-to-file call, so this arms an audio track on the built-in Resampling input (master bus, post-fader, no feedback loop) and records a real-time Arrangement pass, then reads the resulting clip's file path and restores the track's prior input/arm state. Blocks server-side for roughly the real-time duration of the region plus `tail_seconds`.
 
