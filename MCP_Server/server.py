@@ -28,6 +28,7 @@ MODIFYING_COMMANDS = {
     "set_time_signature", "set_clip_loop", "set_clip_length",
     "set_track_arm", "set_track_mute", "set_track_solo",
     "delete_track", "set_master_volume", "set_device_parameter",
+    "set_parameter_by_display_value", "set_track_volume_db",
     "create_scene", "set_scene_name", "set_scene_tempo",
     # Tier 1 cross-track duplicate
     "duplicate_clip_cross_track",
@@ -660,10 +661,36 @@ def set_track_volume(ctx: Context, track_index: int, volume: float) -> str:
             "track_index": track_index,
             "volume": volume
         })
-        return f"Set track {track_index} volume to {result.get('volume', volume)}"
+        disp = result.get("display_value")
+        suffix = f" ({disp})" if disp else ""
+        return f"Set track {track_index} volume to {result.get('volume', volume)}{suffix}"
     except Exception as e:
         logger.error(f"Error setting track volume: {str(e)}")
         return f"Error setting track volume: {str(e)}"
+
+@mcp.tool()
+def set_track_volume_db(ctx: Context, track_index: int, db_value: float) -> str:
+    """
+    Set a track's volume by dB value instead of a raw 0.0-1.0 number. For
+    example db_value=-9.0 sets the fader to -9 dB. Convenience wrapper over the
+    display-value resolution (str_to_value, else a binary search on Live's dB
+    curve) applied to the track's mixer volume. Returns the resulting raw value
+    and dB display so you can confirm the landing.
+
+    Parameters:
+    - track_index: which track to set
+    - db_value: target volume in dB (e.g. -9.0, 0.0 for unity, up to +6)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_volume_db", {
+            "track_index": track_index,
+            "db_value": db_value,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting track volume (dB): {str(e)}")
+        return f"Error setting track volume (dB): {str(e)}"
 
 @mcp.tool()
 def set_track_pan(ctx: Context, track_index: int, pan: float) -> str:
@@ -1570,7 +1597,9 @@ def set_master_volume(ctx: Context, volume: float) -> str:
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("set_master_volume", {"volume": volume})
-        return f"Set master volume to {result.get('volume')}"
+        disp = result.get("display_value")
+        suffix = f" ({disp})" if disp else ""
+        return f"Set master volume to {result.get('volume')}{suffix}"
     except Exception as e:
         logger.error(f"Error setting master volume: {str(e)}")
         return f"Error setting master volume: {str(e)}"
@@ -1608,6 +1637,45 @@ def set_device_parameter(
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
+
+
+@mcp.tool()
+def set_parameter_by_display_value(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameter_index: int,
+    target: str,
+) -> str:
+    """
+    Set a device parameter using its DISPLAYED value instead of a raw 0.0-1.0
+    number. Pass the value the way Live shows it -- e.g. "-9 dB", "120 Hz",
+    "4:1", "0.03 ms" (a leading Unicode minus is accepted). Live resolves it via
+    its own str_to_value when supported, otherwise a str_for_value binary search
+    capped at 12 iterations. The result reports which method was used and the
+    raw + display value Live actually landed on, so you can confirm the match.
+
+    Use this whenever you know the target in musical/engineering units and don't
+    want to reverse-engineer the parameter's non-linear curve.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    - parameter_index: position of the parameter in the device (0-based)
+    - target: the display value as a string, e.g. "-9 dB", "120 Hz", "4:1"
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_parameter_by_display_value", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+            "target": target,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting parameter by display value: {str(e)}")
+        return f"Error setting parameter by display value: {str(e)}"
 
 
 @mcp.tool()
@@ -1856,6 +1924,67 @@ def get_track_devices(ctx: Context, track_index: int) -> str:
     except Exception as e:
         logger.error(f"Error getting track devices: {str(e)}")
         return f"Error getting track devices: {str(e)}"
+
+
+@mcp.tool()
+def get_parameter_display_value(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameter_index: int,
+) -> str:
+    """
+    Read a single device parameter and return BOTH its raw Live value and the
+    value as Live DISPLAYS it (e.g. dB, Hz, ms, ratio). Live maps raw 0.0-1.0
+    (or a device's raw min..max) through a non-linear curve for display, so the
+    raw number alone is not human-meaningful. Returns name, raw_value,
+    display_value, min, and max.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    - parameter_index: position of the parameter in the device (0-based)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_parameter_display_value", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting parameter display value: {str(e)}")
+        return f"Error getting parameter display value: {str(e)}"
+
+
+@mcp.tool()
+def get_device_displayed_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+) -> str:
+    """
+    Read EVERY parameter of a device, each with both its raw Live value and the
+    value as Live displays it (dB/Hz/ms/ratio/etc.). This is the batch version
+    of get_parameter_display_value -- use it to see a whole device's settings in
+    human-readable units in one call. Returns the device name and a list of
+    parameters with index, name, raw_value, display_value, min, and max.
+
+    Parameters:
+    - track_index: which track the device is on
+    - device_index: position of the device in the track's device chain (0-based)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_displayed_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting device displayed parameters: {str(e)}")
+        return f"Error getting device displayed parameters: {str(e)}"
 
 
 # =====================================================================

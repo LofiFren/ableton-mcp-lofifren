@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import traceback
+import re
 
 # Change queue import for Python 2
 try:
@@ -22,6 +23,162 @@ HOST = "localhost"
 # bursts of repeated loads in a session, short enough that a browser rescan
 # (new plugin installed, packs refreshed) gets picked up without restart.
 URI_CACHE_TTL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# Display-value helpers (pure: no Live dependency, unit-testable offline).
+#
+# MCP sets parameters as raw 0.0-1.0 (or a device's raw min..max), but Live
+# DISPLAYS them through a non-linear curve as dB/Hz/ms/ratios. These helpers
+# bridge a human display target ("-9 dB", "120 Hz", "4:1") to a raw value using
+# the parameter's own str_for_value()/str_to_value(), so callers never have to
+# reverse-engineer the curve. Kept at module scope (not on the ControlSurface
+# class) so they import without _Framework and can be exercised from a plain
+# Python process -- see scripts/test_param_display.py.
+# ---------------------------------------------------------------------------
+
+# Unicode minus (U+2212) and common dashes that keyboards / locales emit in
+# place of ASCII '-', so "-9 dB" parses regardless of which the user typed.
+_MINUS_CHARS = u"−‒–—―"
+
+_NUMBER_RE = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+
+
+def _normalize_display_target(s):
+    """Normalise a human-entered display string: coerce to text, map Unicode
+    minus/dash variants to ASCII '-', and strip surrounding whitespace. Does
+    NOT lowercase or strip units -- Live's str_to_value wants the unit text
+    intact (e.g. '-9 dB')."""
+    if s is None:
+        return ""
+    text = s if isinstance(s, str) else str(s)
+    for ch in _MINUS_CHARS:
+        text = text.replace(ch, "-")
+    return text.strip()
+
+
+def _parse_display_number(s):
+    """Parse a Live display string into a single float in a CANONICAL unit so
+    two displays of the same parameter compare monotonically during binary
+    search. Returns None when no number is present.
+
+    Canonicalises the unit switches Live makes across a parameter's range:
+      - frequency: kHz -> Hz    ("1.20 kHz" -> 1200.0)
+      - time:      s/us/ns -> ms ("1.5 s" -> 1500.0, "30 us" -> 0.03)
+      - ratio:     "a:b" -> a/b  ("4.00:1" -> 4.0)
+      - infinity:  "-inf dB" -> -1e30, "inf" -> 1e30  (volume floor/ceiling)
+    Other units (dB, %, st, ...) pass the number through unscaled. Used only
+    for ORDERING in the binary search, so relative monotonicity matters, not
+    physically exact conversion."""
+    if s is None:
+        return None
+    text = _normalize_display_target(s).lower()
+    if not text:
+        return None
+    # Infinity (volume floor/ceiling) -- the number regex won't match "inf".
+    if "inf" in text:
+        return -1e30 if "-" in text else 1e30
+    # Ratio "a:b" -> a/b.
+    if ":" in text:
+        parts = text.split(":")
+        a = _NUMBER_RE.search(parts[0])
+        b = _NUMBER_RE.search(parts[1]) if len(parts) > 1 else None
+        if a and b:
+            try:
+                bval = float(b.group())
+                if bval != 0.0:
+                    return float(a.group()) / bval
+            except ValueError:
+                pass
+        # fall through to a plain-number parse if the ratio didn't resolve
+    m = _NUMBER_RE.search(text)
+    if not m:
+        return None
+    try:
+        value = float(m.group())
+    except ValueError:
+        return None
+    # Unit -> canonical multiplier. Order matters: test qualified units first
+    # (kHz before Hz; ms/us/ns before bare seconds).
+    if "khz" in text:
+        return value * 1000.0
+    if "hz" in text:
+        return value
+    if "ms" in text:
+        return value
+    if "us" in text or u"µs" in text:   # microseconds (µs)
+        return value / 1000.0
+    if "ns" in text:
+        return value / 1000000.0
+    if re.search(r"\d\s*s\b", text):         # bare seconds (not ms/us/ns/Hz/st)
+        return value * 1000.0
+    return value
+
+
+def _binary_search_raw(param, target_num, max_iter=12):
+    """Find the raw value in [param.min, param.max] whose displayed value (via
+    param.str_for_value) is closest to target_num (a canonical number from
+    _parse_display_number). Detects curve direction from the endpoints, then
+    bisects -- capped at max_iter iterations. Returns the best raw float seen.
+
+    Raises ValueError if the endpoints don't yield parseable display numbers
+    (can't establish ordering); the caller should fall back to a raw set."""
+    lo = float(param.min)
+    hi = float(param.max)
+    if hi == lo:
+        return lo
+    if hi < lo:
+        lo, hi = hi, lo
+    lo_num = _parse_display_number(param.str_for_value(lo))
+    hi_num = _parse_display_number(param.str_for_value(hi))
+    if lo_num is None or hi_num is None:
+        raise ValueError("parameter display values are not numeric; cannot binary-search")
+    increasing = hi_num >= lo_num
+    best_raw = lo
+    best_err = None
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        cur = _parse_display_number(param.str_for_value(mid))
+        if cur is None:
+            break
+        err = abs(cur - target_num)
+        if best_err is None or err < best_err:
+            best_err = err
+            best_raw = mid
+        if cur == target_num:
+            return mid
+        go_up = (cur < target_num) if increasing else (cur > target_num)
+        if go_up:
+            lo = mid
+        else:
+            hi = mid
+    return best_raw
+
+
+def _resolve_param_raw(param, target, max_iter=12):
+    """Resolve a human display target ('-9 dB', '4:1', '120 Hz') to a raw value
+    for `param`. Tries param.str_to_value first (Live's own exact inverse);
+    falls back to a str_for_value binary search. Returns (raw, method) where
+    method is 'str_to_value' or 'binary_search'. Raises ValueError if neither
+    path resolves. Does not clamp -- the caller clamps to param.min/max."""
+    normalized = _normalize_display_target(target)
+    if not normalized:
+        raise ValueError("empty display target")
+    # 1) Exact inverse, if this Live version exposes it on the parameter.
+    fn = getattr(param, "str_to_value", None)
+    if callable(fn):
+        try:
+            raw = float(fn(normalized))
+            if raw == raw and raw not in (float("inf"), float("-inf")):  # finite
+                return raw, "str_to_value"
+        except Exception:
+            pass
+    # 2) Binary search on the forward display function.
+    target_num = _parse_display_number(normalized)
+    if target_num is None:
+        raise ValueError("could not parse a number from display target: {0!r}".format(target))
+    raw = _binary_search_raw(param, target_num, max_iter=max_iter)
+    return raw, "binary_search"
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -235,6 +392,8 @@ class AbletonMCP(ControlSurface):
             "search_browser":            lambda p: self._search_browser(p.get("query", ""), p.get("category", "all"), p.get("prefer_preset", True), p.get("max_results", 50)),
             "browse_for_role":           lambda p: self._browse_for_role(p.get("role", "lead"), p.get("max_results", 15)),
             "get_track_devices":         lambda p: self._get_track_devices(p.get("track_index", 0)),
+            "get_parameter_display_value":     lambda p: self._get_parameter_display_value(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0)),
+            "get_device_displayed_parameters": lambda p: self._get_device_displayed_parameters(p.get("track_index", 0), p.get("device_index", 0)),
             # Tier 5 arrangement view (read-only ones)
             "arrangement_capabilities":  lambda p: self._arrangement_capabilities(),
             "get_arrangement_info":      lambda p: self._get_arrangement_info(),
@@ -259,6 +418,7 @@ class AbletonMCP(ControlSurface):
             "delete_clip":            lambda p: self._delete_clip(p.get("track_index", 0), p.get("clip_index", 0)),
             "duplicate_clip_to":      lambda p: self._duplicate_clip_to(p.get("track_index", 0), p.get("clip_index", 0), p.get("target_clip_index", 0)),
             "set_track_volume":       lambda p: self._set_track_volume(p.get("track_index", 0), p.get("volume", 0.85)),
+            "set_track_volume_db":    lambda p: self._set_track_volume_db(p.get("track_index", 0), p.get("db_value", 0.0)),
             "set_track_pan":          lambda p: self._set_track_pan(p.get("track_index", 0), p.get("pan", 0.0)),
             "set_track_send":         lambda p: self._set_track_send(p.get("track_index", 0), p.get("send_index", 0), p.get("value", 0.0)),
             "fire_scene":             lambda p: self._fire_scene(p.get("scene_index", 0)),
@@ -274,6 +434,7 @@ class AbletonMCP(ControlSurface):
             "delete_track":           lambda p: self._delete_track(p.get("track_index", 0)),
             "set_master_volume":      lambda p: self._set_master_volume(p.get("volume", 0.85)),
             "set_device_parameter":   lambda p: self._set_device_parameter(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0), p.get("value", 0.0)),
+            "set_parameter_by_display_value": lambda p: self._set_parameter_by_display_value(p.get("track_index", 0), p.get("device_index", 0), p.get("parameter_index", 0), p.get("target", "")),
             "create_scene":           lambda p: self._create_scene(p.get("index", -1)),
             "set_scene_name":         lambda p: self._set_scene_name(p.get("scene_index", 0), p.get("name", "")),
             "set_scene_tempo":        lambda p: self._set_scene_tempo(p.get("scene_index", 0), p.get("tempo", 120.0)),
@@ -909,14 +1070,38 @@ class AbletonMCP(ControlSurface):
                 raise IndexError("Track index out of range")
 
             track = self._song.tracks[track_index]
-            track.mixer_device.volume.value = max(0.0, min(1.0, volume))
+            vol = track.mixer_device.volume
+            vol.value = max(0.0, min(1.0, volume))
 
             result = {
-                "volume": track.mixer_device.volume.value
+                "volume": vol.value,
+                "display_value": self._safe_display_value(vol),
             }
             return result
         except Exception as e:
             self.log_message("Error setting track volume: " + str(e))
+            raise
+
+    def _set_track_volume_db(self, track_index, db_value):
+        """Set a track's volume to a dB value (e.g. -9.0) using the same
+        display-value resolution as set_parameter_by_display_value, applied to
+        the track's mixer volume parameter (str_to_value, else binary search on
+        the dB curve). Returns the resulting raw value and dB display."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            vol = self._song.tracks[track_index].mixer_device.volume
+            raw, method = _resolve_param_raw(vol, "{0} dB".format(db_value), max_iter=12)
+            vol.value = max(vol.min, min(vol.max, float(raw)))
+            return {
+                "track_index": track_index,
+                "db_requested": float(db_value),
+                "method": method,
+                "raw_value": vol.value,
+                "display_value": self._safe_display_value(vol),
+            }
+        except Exception as e:
+            self.log_message("Error setting track volume (dB): " + str(e))
             raise
 
     def _set_track_pan(self, track_index, pan):
@@ -1176,8 +1361,9 @@ class AbletonMCP(ControlSurface):
     def _set_master_volume(self, volume):
         """Set the master track volume (0.0 to 1.0)."""
         try:
-            self._song.master_track.mixer_device.volume.value = max(0.0, min(1.0, float(volume)))
-            return {"volume": self._song.master_track.mixer_device.volume.value}
+            vol = self._song.master_track.mixer_device.volume
+            vol.value = max(0.0, min(1.0, float(volume)))
+            return {"volume": vol.value, "display_value": self._safe_display_value(vol)}
         except Exception as e:
             self.log_message("Error setting master volume: " + str(e))
             raise
@@ -1205,6 +1391,7 @@ class AbletonMCP(ControlSurface):
                 "device_name": device.name,
                 "parameter_name": param.name,
                 "value": param.value,
+                "display_value": self._safe_display_value(param),
                 "min": param.min,
                 "max": param.max,
             }
@@ -1611,6 +1798,128 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting track devices: " + str(e))
+            raise
+
+    # ----- Parameter display-value tools -----
+    # Live exposes parameters as raw floats but DISPLAYS them through a
+    # non-linear curve (dB/Hz/ms/ratio). These read/write that display layer via
+    # the parameter's own str_for_value()/str_to_value(); resolution logic lives
+    # in the module-level _resolve_param_raw / _parse_display_number helpers.
+
+    def _get_param(self, track_index, device_index, parameter_index):
+        """Validate indices and return (track, device, param). Raises IndexError
+        with a clear message on any out-of-range index. Shared by the parameter
+        display-value tools."""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range (track has {0} devices)".format(len(track.devices)))
+        device = track.devices[device_index]
+        if parameter_index < 0 or parameter_index >= len(device.parameters):
+            raise IndexError("Parameter index out of range (device has {0} parameters)".format(len(device.parameters)))
+        return track, device, device.parameters[parameter_index]
+
+    def _safe_display_value(self, param, value=None):
+        """Return param.str_for_value(value) as a str, or None if Live can't
+        render it. Defaults to the parameter's current value."""
+        try:
+            if value is None:
+                value = param.value
+            return str(param.str_for_value(value))
+        except Exception:
+            return None
+
+    def _param_display_entry(self, param, index):
+        """Build the display dict for one parameter (single + batch getters)."""
+        entry = {
+            "index": index,
+            "name": param.name,
+            "raw_value": param.value,
+            "display_value": self._safe_display_value(param),
+            "min": param.min,
+            "max": param.max,
+        }
+        try:
+            entry["is_quantized"] = bool(getattr(param, "is_quantized", False))
+            entry["is_enabled"] = bool(getattr(param, "is_enabled", True))
+        except Exception:
+            pass
+        return entry
+
+    def _get_parameter_display_value(self, track_index, device_index, parameter_index):
+        """Read one device parameter: raw value plus Live's displayed value
+        (dB/Hz/ms/ratio/etc.) and the parameter's name and range."""
+        try:
+            track, device, param = self._get_param(track_index, device_index, parameter_index)
+            entry = self._param_display_entry(param, parameter_index)
+            entry["track_index"] = track_index
+            entry["device_index"] = device_index
+            entry["device_name"] = device.name
+            return entry
+        except Exception as e:
+            self.log_message("Error getting parameter display value: " + str(e))
+            raise
+
+    def _get_device_displayed_parameters(self, track_index, device_index):
+        """Batch read every parameter of a device, each with its display value.
+        A parameter that throws on access is reported as <unreadable> with null
+        values so the index list stays aligned with get_track_devices."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range (track has {0} devices)".format(len(track.devices)))
+            device = track.devices[device_index]
+            params = []
+            for p_index, param in enumerate(device.parameters):
+                try:
+                    params.append(self._param_display_entry(param, p_index))
+                except Exception:
+                    params.append({
+                        "index": p_index, "name": "<unreadable>", "raw_value": None,
+                        "display_value": None, "min": None, "max": None,
+                    })
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_count": len(params),
+                "parameters": params,
+            }
+        except Exception as e:
+            self.log_message("Error getting device displayed parameters: " + str(e))
+            raise
+
+    def _set_parameter_by_display_value(self, track_index, device_index, parameter_index, target):
+        """Set a device parameter from a human display value ('-9 dB', '120 Hz',
+        '4:1', '0.03 ms', Unicode minus accepted). Uses Live's str_to_value when
+        available, else a str_for_value binary search (<= 12 iterations); the
+        resolved raw value is clamped to the parameter's range before applying.
+        Returns the requested target, the method used, and the resulting raw +
+        display value so the caller can confirm what Live actually landed on."""
+        try:
+            track, device, param = self._get_param(track_index, device_index, parameter_index)
+            if not getattr(param, "is_enabled", True):
+                raise Exception("Parameter '{0}' is not enabled".format(param.name))
+            raw, method = _resolve_param_raw(param, target, max_iter=12)
+            param.value = max(param.min, min(param.max, float(raw)))
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_index": parameter_index,
+                "parameter_name": param.name,
+                "requested": _normalize_display_target(target),
+                "method": method,
+                "raw_value": param.value,
+                "display_value": self._safe_display_value(param),
+                "min": param.min,
+                "max": param.max,
+            }
+        except Exception as e:
+            self.log_message("Error setting parameter by display value: " + str(e))
             raise
 
     # ----- Tier 5 arrangement view (BETA, capability-probed) -----
